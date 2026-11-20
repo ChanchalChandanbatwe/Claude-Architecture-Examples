@@ -2,203 +2,289 @@ import os
 import asyncio
 from pathlib import Path
 from dotenv import load_dotenv
-import json
 from anthropic import AsyncAnthropic, DefaultAioHttpClient
 
 load_dotenv(Path(__file__).parent.parent / ".env")
 
+# ---------------------------------------------------------------------------
+# Use case: Job Application Screener — Hub & Spoke Architecture
+#
+# Hub (coordinator): owns routing decisions and result aggregation
+# Spokes:            independent Claude agents, each with a single responsibility
+#   - keyword_scanner:   fast presence/absence check for required skills
+#   - deep_evaluator:    assesses experience depth and seniority fit
+#   - red_flag_detector: identifies disqualifying signals
+#   - score_aggregator:  combines all spoke outputs into a final decision
+# ---------------------------------------------------------------------------
+
 model = "claude-haiku-4-5-20251001"
 
 # ---------------------------------------------------------------------------
-# Use case: job application scanner, built as HUB AND SPOKE.
-#
-#                       ┌── skill_gap ────┐
-#                       ├── resume_tailor ┤
-#   candidate ◄──► HUB ─┤                 │   (spokes never talk to each other;
-#                       ├── cover_letter ─┤    every message goes through the hub)
-#                       └── interview_prep┘
-#
-# The HUB (Coordinator) owns everything that needs judgment or control:
-#   1. DECOMPOSE the request into subtasks
-#   2. ASSESS complexity and ROUTE subtasks to spokes
-#   3. AGGREGATE spoke outputs into one answer
-# The SPOKES only do their one narrow job and return text to the hub.
+# Spoke system prompts
 # ---------------------------------------------------------------------------
 
-JOB_POSTING = """Senior Backend Engineer — Acme Payments
-Requirements: 5+ years Python, REST API design, PostgreSQL, AWS (ECS, SQS),
-experience leading a small team. Nice to have: Kubernetes, payments domain experience."""
+KEYWORD_SCANNER_PROMPT = """You are a resume keyword scanner. Check whether required skills
+from the job posting appear explicitly in the resume.
 
-RESUME = """Jane Doe — Backend Engineer, 6 years experience
-- Built Python/Flask REST APIs serving 2M requests/day at a logistics startup
-- Designed PostgreSQL schemas and tuned slow queries (40% faster)
-- Deployed services on AWS EC2 and Lambda
-- Mentored 2 junior developers
-Skills: Python, Flask, PostgreSQL, Docker, AWS (EC2, Lambda), Git"""
+For each required skill output one line:
+  FOUND: <skill>
+  MISSING: <skill>
+
+Be literal. Do not infer or extrapolate. Report only what is explicitly stated."""
+
+DEEP_EVALUATOR_PROMPT = """You are a senior technical recruiter evaluating depth of experience.
+
+Assess whether the candidate's background genuinely matches the role's seniority and scope.
+Consider: years of experience, project scale, leadership signals, recency of skills.
+
+Write a short assessment paragraph, then end with exactly one of:
+  VERDICT: Strong Fit
+  VERDICT: Partial Fit
+  VERDICT: Weak Fit"""
+
+RED_FLAG_DETECTOR_PROMPT = """You are a resume red flag detector. Identify disqualifying signals only.
+
+Look for: unexplained employment gaps over 6 months, frequent job hopping (under 1 year at
+multiple consecutive roles), clear seniority mismatch, or missing hard requirements.
+
+Output each finding as:
+  RED FLAG: <description>
+
+If nothing disqualifying is found, output only:
+  NO RED FLAGS"""
+
+SCORE_AGGREGATOR_PROMPT = """You are a hiring decision aggregator. You receive outputs from three
+independent screening agents and produce a single structured recommendation.
+
+Output exactly in this format:
+  KEYWORD MATCH: <X of Y required skills found>
+  EXPERIENCE FIT: <Strong / Partial / Weak>
+  RED FLAGS: <None, or a brief summary>
+  DECISION: <HIRE / MAYBE / PASS>
+  REASON: <one sentence justification>"""
 
 # ---------------------------------------------------------------------------
-# SPOKES — each one is a single model call with its own system prompt.
-# A spoke knows nothing about other spokes or the hub's plan. It receives a
-# task (and optionally context) FROM the hub and returns text TO the hub.
+# Spoke agents — each is an independent Claude API call
 # ---------------------------------------------------------------------------
 
-SPOKE_PROMPTS = {
-    "skill_gap": "You are a skill-gap analyst. Compare the résumé to the job posting. "
-                 "List matched skills, missing skills, and a match score out of 10. Be concise.",
-    "resume_tailor": "You are a résumé coach. Suggest 3 concrete bullet-point rewrites that "
-                     "make the résumé fit the job posting. Do not invent experience.",
-    "cover_letter": "You are a cover letter writer. Write a short 3-paragraph cover letter "
-                    "for this candidate and job. Do not invent experience.",
-    "interview_prep": "You are an interview coach. Give the 4 most likely interview questions "
-                      "for this role, each with a one-line tip tailored to the candidate.",
-}
-
-async def run_spoke(client, name: str, task: str, context: str = "") -> str:
-    system = f"{SPOKE_PROMPTS[name]}\n\nJOB POSTING:\n{JOB_POSTING}\n\nRÉSUMÉ:\n{RESUME}"
-    if context:
-        system += f"\n\nEARLIER FINDINGS (provided by the coordinator):\n{context}"
+async def spoke_keyword_scanner(client, job_posting: str, resume: str) -> str:
     response = await client.messages.create(
         model=model,
-        max_tokens=600,
-        system=system,
-        messages=[{"role": "user", "content": task}],
+        max_tokens=512,
+        system=KEYWORD_SCANNER_PROMPT,
+        messages=[{"role": "user", "content": f"JOB POSTING:\n{job_posting}\n\nRESUME:\n{resume}"}],
     )
-    return "".join(b.text for b in response.content if b.type == "text")
+    return response.content[0].text
+
+
+async def spoke_deep_evaluator(client, job_posting: str, resume: str) -> str:
+    response = await client.messages.create(
+        model=model,
+        max_tokens=512,
+        system=DEEP_EVALUATOR_PROMPT,
+        messages=[{"role": "user", "content": f"JOB POSTING:\n{job_posting}\n\nRESUME:\n{resume}"}],
+    )
+    return response.content[0].text
+
+
+async def spoke_red_flag_detector(client, job_posting: str, resume: str) -> str:
+    response = await client.messages.create(
+        model=model,
+        max_tokens=512,
+        system=RED_FLAG_DETECTOR_PROMPT,
+        messages=[{"role": "user", "content": f"JOB POSTING:\n{job_posting}\n\nRESUME:\n{resume}"}],
+    )
+    return response.content[0].text
+
+
+async def spoke_score_aggregator(client, keyword_result: str, deep_result: str, red_flag_result: str) -> str:
+    response = await client.messages.create(
+        model=model,
+        max_tokens=512,
+        system=SCORE_AGGREGATOR_PROMPT,
+        messages=[{"role": "user", "content": (
+            f"Keyword Scanner:\n{keyword_result}\n\n"
+            f"Deep Evaluator:\n{deep_result}\n\n"
+            f"Red Flag Detector:\n{red_flag_result}"
+        )}],
+    )
+    return response.content[0].text
 
 # ---------------------------------------------------------------------------
-# HUB — the coordinator. The only component that sees the whole picture.
+# Async tool dispatcher — coordinator calls spokes through here
 # ---------------------------------------------------------------------------
 
-PLAN_TOOL = {
-    "name": "create_plan",
-    "description": "Break a job-application request into subtasks and assign each to a spoke.",
-    "input_schema": {
-        "type": "object",
-        "properties": {
-            "complexity": {
-                "type": "string",
-                "enum": ["simple", "complex"],
-                "description": "simple = ONE spoke can handle it. complex = needs several spokes.",
-            },
-            "subtasks": {
-                "type": "array",
-                "items": {
-                    "type": "object",
-                    "properties": {
-                        "spoke": {"type": "string", "enum": list(SPOKE_PROMPTS)},
-                        "task": {"type": "string", "description": "A self-contained instruction for that spoke"},
-                    },
-                    "required": ["spoke", "task"],
-                },
-            },
-        },
-        "required": ["complexity", "subtasks"],
-    },
+async def dispatch_tool(client, name: str, inputs: dict) -> str:
+    if name == "run_keyword_scanner":
+        return await spoke_keyword_scanner(client, **inputs)
+    if name == "run_deep_evaluator":
+        return await spoke_deep_evaluator(client, **inputs)
+    if name == "run_red_flag_detector":
+        return await spoke_red_flag_detector(client, **inputs)
+    if name == "run_score_aggregator":
+        return await spoke_score_aggregator(client, **inputs)
+    return f"Unknown tool: {name}"
+
+# ---------------------------------------------------------------------------
+# Tool schemas — what the coordinator hub sees
+# ---------------------------------------------------------------------------
+
+JOB_RESUME_PROPERTIES = {
+    "job_posting": {"type": "string", "description": "The full job posting text"},
+    "resume":      {"type": "string", "description": "The full resume text"},
 }
 
-DECOMPOSE_PROMPT = """You are the coordinator of a job application team. You never do the work yourself.
-Spokes available:
-- skill_gap: compares résumé to posting, finds matched/missing skills
-- resume_tailor: rewrites résumé bullets for the posting
-- cover_letter: writes a cover letter
-- interview_prep: predicts interview questions and gives tips
-
-Decompose the request into the smallest set of subtasks needed.
-A narrow request needs exactly one subtask. A broad request ("fully prepare me")
-needs one subtask per relevant spoke."""
-
-AGGREGATE_PROMPT = """You are the coordinator of a job application team. Combine the spoke
-outputs into one application package with clear section headings.
-Start with a 2-line overall verdict on the candidate's fit. Use only what the
-spokes produced; do not add new claims about the candidate."""
-
-class Coordinator:
-    def __init__(self, client):
-        self.client = client
-
-    # --- Hub responsibility 1: DECOMPOSE + ASSESS COMPLEXITY ---------------
-    async def decompose(self, request: str) -> dict:
-        response = await self.client.messages.create(
-            model=model,
-            max_tokens=1024,
-            system=DECOMPOSE_PROMPT,
-            tools=[PLAN_TOOL],
-            tool_choice={"type": "tool", "name": "create_plan"},
-            messages=[{"role": "user", "content": request}],
-        )
-        return next(b.input for b in response.content if b.type == "tool_use")
-
-    # --- Hub responsibility 2: ROUTE ---------------------------------------
-    # Decided in code, from complexity and dependencies:
-    #   simple  -> call the single spoke
-    #   complex -> skill_gap first (others depend on it), then the rest in parallel.
-    #              The hub relays skill_gap's findings; spokes never talk directly.
-    async def route(self, plan: dict) -> list[dict]:
-        subtasks = plan["subtasks"]
-
-        async def call_spoke(subtask, context=""):
-            print(f"  → Hub sends to [{subtask['spoke']}]: {subtask['task']}")
-            answer = await run_spoke(self.client, subtask["spoke"], subtask["task"], context)
-            print(f"  ← [{subtask['spoke']}] replied to hub")
-            return {**subtask, "answer": answer}
-
-        if plan["complexity"] == "simple":
-            return [await call_spoke(subtasks[0])]
-
-        results = []
-        gap_tasks = [s for s in subtasks if s["spoke"] == "skill_gap"]
-        other_tasks = [s for s in subtasks if s["spoke"] != "skill_gap"]
-
-        context = ""
-        if gap_tasks:
-            gap_result = await call_spoke(gap_tasks[0])
-            results.append(gap_result)
-            context = gap_result["answer"]
-
-        results += await asyncio.gather(*(call_spoke(s, context) for s in other_tasks))
-        return results
-
-    # --- Hub responsibility 3: AGGREGATE -----------------------------------
-    async def aggregate(self, request: str, results: list[dict]) -> str:
-        findings = "\n\n".join(f"### {r['spoke']}\n{r['answer']}" for r in results)
-        response = await self.client.messages.create(
-            model=model,
-            max_tokens=2048,
-            system=AGGREGATE_PROMPT,
-            messages=[{"role": "user", "content": f"Request: {request}\n\nSpoke outputs:\n{findings}"}],
-        )
-        return next(b.text for b in response.content if b.type == "text")
-
-    # --- Entry point: the only way in or out of the system ------------------
-    async def handle(self, request: str) -> str:
-        plan = await self.decompose(request)
-        print(f"[1] Decomposed: complexity={plan['complexity']}, "
-              f"spokes={json.dumps([s['spoke'] for s in plan['subtasks']])}")
-
-        print("[2] Routing:")
-        results = await self.route(plan)
-
-        print("[3] Aggregating...")
-        return await self.aggregate(request, results)
-
-# ---------------------------------------------------------------------------
-# Two requests with different complexity, to show the routing difference.
-# ---------------------------------------------------------------------------
-
-REQUESTS = [
-    "Which skills am I missing for this job?",
-    "I'm applying to this job tomorrow. Fully prepare me: fit check, résumé fixes, cover letter, and interview prep.",
+tools = [
+    {
+        "name": "run_keyword_scanner",
+        "description": (
+            "Spoke agent: scans the resume for presence or absence of each required skill "
+            "listed in the job posting. Fast, literal check — no inference."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": JOB_RESUME_PROPERTIES,
+            "required": ["job_posting", "resume"],
+        },
+    },
+    {
+        "name": "run_deep_evaluator",
+        "description": (
+            "Spoke agent: assesses whether the candidate's experience depth and seniority "
+            "genuinely matches the role. Returns a verdict of Strong / Partial / Weak Fit."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": JOB_RESUME_PROPERTIES,
+            "required": ["job_posting", "resume"],
+        },
+    },
+    {
+        "name": "run_red_flag_detector",
+        "description": (
+            "Spoke agent: identifies disqualifying signals such as employment gaps, "
+            "job hopping, or missing hard requirements."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": JOB_RESUME_PROPERTIES,
+            "required": ["job_posting", "resume"],
+        },
+    },
+    {
+        "name": "run_score_aggregator",
+        "description": (
+            "Spoke agent: takes outputs from the three screening agents and produces "
+            "a final structured HIRE / MAYBE / PASS recommendation. "
+            "Call this only after all three screening agents have returned results."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "keyword_result":   {"type": "string", "description": "Output from run_keyword_scanner"},
+                "deep_result":      {"type": "string", "description": "Output from run_deep_evaluator"},
+                "red_flag_result":  {"type": "string", "description": "Output from run_red_flag_detector"},
+            },
+            "required": ["keyword_result", "deep_result", "red_flag_result"],
+        },
+    },
 ]
+
+# ---------------------------------------------------------------------------
+# Coordinator (hub) system prompt
+# ---------------------------------------------------------------------------
+
+COORDINATOR_PROMPT = """You are a job application screening coordinator.
+
+Your job is to orchestrate three independent screening agents and then aggregate their results.
+
+Steps:
+1. Run all three screening agents — keyword_scanner, deep_evaluator, red_flag_detector —
+   passing the full job_posting and resume text to each.
+2. Once all three have returned results, pass their outputs to run_score_aggregator.
+3. Present the final recommendation to the user.
+
+You may run the three screening agents in any order. Do not skip any of them."""
+
+# ---------------------------------------------------------------------------
+# Coordinator agentic loop
+# ---------------------------------------------------------------------------
+
+async def create(client, messages):
+    return await client.messages.create(
+        model=model,
+        max_tokens=2048,
+        system=COORDINATOR_PROMPT,
+        tools=tools,
+        messages=messages,
+    )
+
 
 async def main() -> None:
     async with AsyncAnthropic(
         api_key=os.environ.get("ANTHROPIC_API_KEY"),
         http_client=DefaultAioHttpClient(),
     ) as client:
-        hub = Coordinator(client)
-        for request in REQUESTS:
-            print("=" * 70)
-            print(f"Candidate: {request}\n")
-            print(f"\nCoordinator:\n{await hub.handle(request)}\n")
+
+        job_posting = """\
+Title: Senior Python Backend Engineer
+Required skills: Python (5+ years), FastAPI, PostgreSQL, Docker, REST API design
+Nice to have: Kubernetes, Redis, system design at scale
+Seniority: Senior (5-8 years total experience)"""
+
+        resume = """\
+Alex Chen — 7 years experience
+2022–present: Backend Engineer, FinTech startup — Python, FastAPI, PostgreSQL, Docker
+2019–2022:    Software Engineer, SaaS company — Python, Django, MySQL
+2017–2019:    Junior Developer, agency — PHP, JavaScript
+Skills: Python, FastAPI, PostgreSQL, Docker, REST APIs, some Redis
+Education: B.Sc. Computer Science"""
+
+        user_message = (
+            f"Please screen this application.\n\n"
+            f"JOB POSTING:\n{job_posting}\n\n"
+            f"RESUME:\n{resume}"
+        )
+
+        print(f"User: Screen application for Senior Python Backend Engineer\n")
+        messages = [{"role": "user", "content": user_message}]
+
+        # --- Coordinator agentic loop ---
+        # 4 spokes + 1 final end_turn = 5 expected steps; cap at 10 as a safety net
+        MAX_STEPS = 10
+        step = 0
+        while step < MAX_STEPS:
+            step += 1
+            response = await create(client, messages)
+            print(f"[Step {step}/{MAX_STEPS}] stop_reason={response.stop_reason}")
+
+            if response.stop_reason == "end_turn":
+                final_text = next(
+                    (b.text for b in response.content if hasattr(b, "text")),
+                    "(no text)"
+                )
+                print(f"\nCoordinator: {final_text}")
+                break
+
+            if response.stop_reason == "tool_use":
+                tool_results = []
+                for block in response.content:
+                    if block.type == "tool_use":
+                        print(f"  → Coordinator routes to spoke: {block.name}")
+                        result = await dispatch_tool(client, block.name, block.input)
+                        print(f"    Spoke result:\n{result}\n")
+                        tool_results.append({
+                            "type": "tool_result",
+                            "tool_use_id": block.id,
+                            "content": result,
+                        })
+
+                messages += [
+                    {"role": "assistant", "content": response.content},
+                    {"role": "user", "content": tool_results},
+                ]
+
+        else:
+            print(f"\n[WARN] Reached max steps ({MAX_STEPS}) without end_turn — aborting loop.")
 
 asyncio.run(main())
