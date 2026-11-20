@@ -1,26 +1,61 @@
-import asyncio
 import os
-import sys
+import asyncio
+from pathlib import Path
+from dotenv import load_dotenv
+import json
+from anthropic import AsyncAnthropic, DefaultAioHttpClient
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "lib"))
+load_dotenv(Path(__file__).parent.parent / ".env")
 
-from claude_agent_sdk import ClaudeAgentOptions, query
-from sdk_parser import log_message
+def tool_magic_eyeball(question):
+  import random
+  return random.choice(["Yes", "No", "Ask again later"])
 
-options = ClaudeAgentOptions(
-    model="claude-haiku-4-5-20251001",
-    allowed_tools=["WebFetch"],
-    max_turns=5,
-)
+tools = [
+  {
+    "name":"magic_eyeball",
+    "description": "When the user asks a yes or no fortune telling question call this function",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "question": {"type": "string"}
+      },
+      "required": ["question"]
+    }
+  }
+]
 
-PROMPT = "What's the weather in Paris? Fetch https://wttr.in/Paris?format=3"
+model = "claude-haiku-4-5-20251001"
 
+async def create(client, messages):
+  return await client.messages.create(
+      model=model,
+      max_tokens=1024,
+      tools=tools,
+      messages=messages,
+  )
 
 async def main() -> None:
-    async for message in query(prompt=PROMPT, options=options):
-        print(log_message(message))
-        if type(message).__name__ == "AssistantMessage":
-            print(f"[stop_reason] {message.stop_reason}")
+  async with AsyncAnthropic(
+      api_key=os.environ.get("ANTHROPIC_API_KEY"),
+      http_client=DefaultAioHttpClient(),
+  ) as client:
+    user_message = "Hey Claude, will I be a billionaire living on Mars in 2026?"
+    messages = [{"role": "user", "content": user_message}]
+    response = await create(client, messages)
+    print('original:')
+    print(json.dumps(response.model_dump(), indent=2))
+    tool_use = next(block for block in response.content if block.type == "tool_use")
+    tool_result = tool_magic_eyeball(**tool_use.input)
+    messages += [
+        {"role": "assistant", "content": response.content},
+        {"role": "user", "content": [{"type": "tool_result", "tool_use_id": tool_use.id, "content": tool_result}]},
+    ]
+    response = await create(client, messages)
+    print('follow up:')
+    print(json.dumps(response.model_dump(), indent=2))
 
+    #while response.stop_reason == "tool_use":
+    #print(tool_use)
 
 asyncio.run(main())
